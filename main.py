@@ -284,7 +284,7 @@ def save_transcript(transcript: str, video_id: str, title: str, published_at: Op
     filepath = transcripts_dir / filename
     
     try:
-        filepath.write_text(transcript, encoding="utf-8")
+        filepath.write_text(clean_caption_text(transcript), encoding="utf-8")
         logging.info(f"💾 Saved transcript: {filename}")
     except Exception as e:
         logging.warning(f"⚠️  Failed to save transcript {filename}: {e}")
@@ -299,6 +299,20 @@ def _strip_vtt(vtt_text: str) -> str:
             continue
         lines.append(line.strip())
     return " ".join(lines)
+
+
+def clean_caption_text(text: str) -> str:
+    """Normalize caption-like transcript text to plain readable text."""
+    if not text:
+        return text
+
+    cleaned = text
+    cleaned = re.sub(r"^\s*Kind:\s*captions\s+Language:\s*[A-Za-z0-9_-]+\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", " ", cleaned)
+    cleaned = re.sub(r"</?c[^>]*>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("&gt;&gt;", " ").replace("&gt;", " ").replace("&lt;", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def fetch_transcript_with_ytdlp(video_id: str, lang: str = "en") -> Optional[str]:

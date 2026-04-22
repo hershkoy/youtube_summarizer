@@ -58,6 +58,12 @@ Skip existing transcript files (default behavior):
 Force re-fetch even if transcript files already exist:
 > python main.py --channels channels.txt --per-channel 30 --transcripts-only --no-skip-existing
 
+Clean existing transcript files in a folder (in-place):
+> python clean_transcripts.py --dir transcripts
+
+Preview only:
+> python clean_transcripts.py --dir transcripts --dry-run
+
 debug:
 > yt-dlp -v --print-traffic https://youtu.be/nLTSWy3tze4 
 
