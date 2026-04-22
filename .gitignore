@@ -1,0 +1,9 @@
+.venv
+channels/
+transcripts/
+cookies.txt 
+.cursor/
+rustypipe-botguard.exe
+.env
+channels.txt
+summaries.docx
