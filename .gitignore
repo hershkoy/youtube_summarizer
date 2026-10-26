@@ -6,4 +6,6 @@ cookies.txt
 rustypipe-botguard.exe
 .env
 channels.txt
-summaries.docx
+
+*.docx
+__pycache__/

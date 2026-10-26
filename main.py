@@ -9,8 +9,13 @@ YouTube Channel Summarizer -> Word (.docx)
 
 Run (example):
 python main.py --channels channels.txt --out summaries.docx --per-channel 30 --cookies-from-browser firefox --summarize-url-fallback
+python main.py --youtube_video "https://www.youtube.com/watch?v=fg-kBYiChK4" --out video.docx
+python main.py --youtube_video "https://www.youtube.com/watch?v=fg-kBYiChK4" --transcribe_only
+python main.py --text-files-dir path\to\folder --out summaries.docx --rtl
 
 Optional extras:
+  --rtl
+  --mcp
   --cookies-from-browser chrome --cookies-profile "Default"
   --cookies cookies.txt
   --rustypipe-bin C:\\path\\to\\rustypipe-botguard.exe   (only if not on PATH)
@@ -20,6 +25,7 @@ Optional extras:
 import argparse
 import os
 import re
+import sys
 import time
 import logging
 import tempfile
@@ -33,15 +39,18 @@ from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from docx import Document
 from docx.shared import Pt
+from rtl_docx import apply_rtl
 from datetime import datetime
 from googleapiclient.errors import HttpError
 
 
 # -------------------- Config --------------------
 
-def load_env(require_gemini: bool = True) -> None:
+def load_env(require_gemini: bool = True, require_youtube: bool = True, require_kimi: bool = False) -> None:
     load_dotenv()
-    required_keys = ["YOUTUBE_API_KEY"]
+    required_keys = []
+    if require_youtube:
+        required_keys.append("YOUTUBE_API_KEY")
     if require_gemini:
         required_keys.append("GEMINI_API_KEY")
 
@@ -49,6 +58,8 @@ def load_env(require_gemini: bool = True) -> None:
     for key in required_keys:
         if not os.getenv(key):
             missing.append(key)
+    if require_kimi and not (os.getenv("MOONSHOT_API_KEY") or os.getenv("KIMI_API_KEY")):
+        missing.append("MOONSHOT_API_KEY")
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}. Create a .env file (see .env.example).")
 
@@ -196,6 +207,22 @@ def get_video_snippet(youtube, video_id: str) -> dict:
     return snippets.get(video_id, {})
 
 
+_VIDEO_ID_RE = re.compile(
+    r"(?:v=|/videos/|embed/|/shorts/|youtu\.be/)([0-9A-Za-z_-]{11})"
+)
+
+
+def parse_video_id(video: str) -> str:
+    """Accept a raw 11-char id or a YouTube watch, shorts, embed, or youtu.be URL."""
+    value = (video or "").strip()
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
+        return value
+    match = _VIDEO_ID_RE.search(value)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not parse a YouTube video id from: {video}")
+
+
 def transcript_file_exists(video_id: str, title: str, published_at: Optional[str]) -> bool:
     """Check whether transcript file already exists for this video/title/date tuple."""
     transcripts_dir = Path("transcripts")
@@ -211,6 +238,20 @@ def get_video_id_from_transcript_filename(filename: str) -> Optional[str]:
     if m:
         return m.group(1)
     return None
+
+
+def find_saved_transcript(video_id: str) -> Optional[Path]:
+    """Return the newest transcripts/*.txt file for this video id, if one exists."""
+    transcripts_dir = Path("transcripts")
+    if not transcripts_dir.is_dir():
+        return None
+    matches = [
+        path for path in transcripts_dir.glob("*.txt")
+        if path.is_file() and get_video_id_from_transcript_filename(path.name) == video_id
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
 
 
 def get_existing_transcript_video_ids() -> set:
@@ -333,7 +374,7 @@ def fetch_transcript_with_ytdlp(video_id: str, lang: str = "en") -> Optional[str
         "nocheckcertificate": True,
     }
 
-    ydl_opts["verbose"] = True
+    ydl_opts["verbose"] = bool(getattr(fetch_transcript_with_ytdlp, "_verbose", False))
 
     # Extractor args (PO-token provider + client choice)
     ea = ydl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})
@@ -421,12 +462,27 @@ def fetch_transcript_text(video_id: str) -> Optional[str]:
 
 # -------------------- Gemini --------------------
 
+def _api_error_message(response: requests.Response) -> str:
+    detail = response.text.strip()
+    try:
+        body = response.json()
+    except Exception:
+        return detail
+    error = body.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"])
+    if isinstance(error, str):
+        return error
+    return detail
+
+
 def _gemini_request(payload: dict) -> str:
     api_key = os.environ["GEMINI_API_KEY"]
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     r = requests.post(endpoint, headers=headers, json=payload, timeout=90)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Gemini API {r.status_code}: {_api_error_message(r)}")
     data = r.json()
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -434,15 +490,224 @@ def _gemini_request(payload: dict) -> str:
         return "Summary unavailable (unexpected API response)."
 
 
+def _kimi_request(prompt: str) -> str:
+    """OpenAI-compatible chat call against platform.kimi.ai (api.moonshot.ai)."""
+    api_key = os.getenv("MOONSHOT_API_KEY") or os.getenv("KIMI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing MOONSHOT_API_KEY.")
+    model = os.getenv("KIMI_MODEL", "kimi-k3.1-pro")
+    base = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1").rstrip("/")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        # K3 thinks by default at effort "max". Low keeps lecture summaries cheaper and faster.
+        "reasoning_effort": os.getenv("KIMI_REASONING_EFFORT", "low"),
+    }
+    r = requests.post(
+        f"{base}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Kimi API {r.status_code}: {_api_error_message(r)}")
+    data = r.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        return "Summary unavailable (unexpected API response)."
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    content = (content or "").strip()
+    return content or "Summary unavailable (empty model response)."
+
+
+def _complete(prompt: str) -> str:
+    if os.getenv("SUMMARY_PROVIDER", "gemini") == "kimi":
+        return _kimi_request(prompt)
+    return _gemini_request({"contents": [{"parts": [{"text": prompt}]}]})
+
+
+def _is_fatal_summary_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(code in msg for code in ("API 401", "API 402", "API 403", "API 429"))
+
+
+_SUMMARY_SHAPE = (
+    "- a 3–5 sentence overview,\n"
+    "- 5 concise bullet points of key insights,\n"
+    "- and 3 suggested action items if applicable.\n\n"
+    "Keep it under 1800 characters total."
+)
+# Stay under typical request sizes. Longer files are summarized in parts, then merged.
+_TEXT_CHUNK_CHARS = 80000
+
+
 def gemini_summarize(transcript: str) -> str:
     prompt = (
         "You are a helpful assistant. Summarize this YouTube video transcript in:\n"
-        "- a 3–5 sentence overview,\n"
-        "- 5 concise bullet points of key insights,\n"
-        "- and 3 suggested action items if applicable.\n\n"
-        "Keep it under 1800 characters total. Here is the transcript:\n\n"
+        f"{_SUMMARY_SHAPE}\n\n"
+        "Here is the transcript:\n\n"
     )
-    return _gemini_request({"contents": [{"parts": [{"text": prompt + transcript[:25000]}]}]})
+    return _complete(prompt + transcript[:25000])
+
+
+def _natural_sort_key(name: str):
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", name)]
+
+
+def list_text_files(directory: Path) -> List[Path]:
+    """Non-recursive *.txt files, ordered so 2_ comes before 10_."""
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Not a directory: {directory}")
+    files = [path for path in directory.glob("*.txt") if path.is_file()]
+    return sorted(files, key=lambda path: _natural_sort_key(path.name))
+
+
+def _read_text_file(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _split_text_chunks(text: str, size: int = _TEXT_CHUNK_CHARS) -> List[str]:
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            split_at = text.rfind("\n", start, end)
+            if split_at > start + size // 2:
+                end = split_at
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end
+    return chunks or [text]
+
+
+def gemini_summarize_text(text: str) -> str:
+    """Summarize a local text file in the source language. Long files are chunked."""
+    text = (text or "").strip()
+    if not text:
+        return "No text to summarize."
+    chunks = _split_text_chunks(text)
+    if len(chunks) == 1:
+        prompt = (
+            "Summarize the following text in the same language as the source:\n"
+            f"{_SUMMARY_SHAPE}\n\n"
+            + chunks[0]
+        )
+        return _complete(prompt)
+
+    partials = []
+    for index, chunk in enumerate(chunks, 1):
+        prompt = (
+            f"This is part {index} of {len(chunks)} of a longer document. "
+            "Summarize this part only, in the same language as the source. "
+            "Use short bullets. Do not invent content from other parts.\n\n"
+            + chunk
+        )
+        partials.append(_complete(prompt))
+    merged = "\n\n".join(f"Part {index}:\n{part}" for index, part in enumerate(partials, 1))
+    prompt = (
+        "Combine these partial summaries of one document into a single summary, "
+        "in the same language as the partials:\n"
+        f"{_SUMMARY_SHAPE}\n\n"
+        + merged
+    )
+    return _complete(prompt)
+
+
+def _existing_summaries(out_path: Path) -> dict:
+    """Headings already in the docx, skipping sections that are only an API error."""
+    if not out_path.exists():
+        return {}
+    doc = Document(out_path)
+    found = {}
+    current = None
+    buf = []
+
+    def store():
+        if not current:
+            return
+        text = "\n".join(buf).strip()
+        if text and not text.startswith("Error summarizing:"):
+            found[current] = text
+
+    for paragraph in doc.paragraphs:
+        style = paragraph.style.name if paragraph.style is not None else ""
+        if style.startswith("Heading"):
+            store()
+            current = paragraph.text.strip()
+            buf = []
+            continue
+        if current and paragraph.text.strip():
+            buf.append(paragraph.text)
+    store()
+    return found
+
+
+def _save_docx(doc: Document, path: str, rtl: bool) -> None:
+    if rtl:
+        apply_rtl(doc)
+    doc.save(path)
+
+
+def _save_text_summaries(folder: Path, out_path: str, summaries: List[tuple], rtl: bool = False) -> None:
+    doc = Document()
+    doc.add_heading(f"Text summaries: {folder}", level=0)
+    for stem, summary in summaries:
+        if not summary:
+            continue
+        doc.add_heading(stem, level=2)
+        doc.add_paragraph(summary)
+    _save_docx(doc, out_path, rtl)
+
+
+def summarize_text_files(directory: str, out_path: str, sleep_s: float, rtl: bool = False) -> None:
+    """Summarize every *.txt file in a folder. Other extensions are ignored.
+
+    Successful sections already in out_path are kept. Quota and auth errors stop
+    the run instead of writing an error paragraph for every remaining file.
+    """
+    log = logging.getLogger(__name__)
+    folder = Path(directory)
+    files = list_text_files(folder)
+    if not files:
+        raise SystemExit(f"No .txt files found in {folder}")
+
+    kept = _existing_summaries(Path(out_path))
+    summaries: List[tuple] = [(path.stem, kept.get(path.stem)) for path in files]
+    pending = sum(1 for _, summary in summaries if not summary)
+    log.info(f"Summarizing {pending} of {len(files)} .txt file(s) from {folder} ({len(files) - pending} already saved)")
+    _save_text_summaries(folder, out_path, summaries, rtl)
+
+    for index, path in enumerate(files):
+        if summaries[index][1]:
+            log.info(f"Keeping existing summary: {path.name}")
+            continue
+        log.info(f"Summarizing {path.name}")
+        try:
+            summary = gemini_summarize_text(_read_text_file(path))
+            log.info(f"Summary complete: {path.name}")
+        except Exception as e:
+            log.error(f"Summary error for {path.name}: {e}")
+            if _is_fatal_summary_error(e):
+                _save_text_summaries(folder, out_path, summaries, rtl)
+                raise SystemExit(str(e)) from e
+            summary = f"Error summarizing: {e}"
+        summaries[index] = (path.stem, summary)
+        _save_text_summaries(folder, out_path, summaries, rtl)
+        time.sleep(sleep_s)
+
+    print(f"Done! File saved as: {out_path}")
 
 
 def gemini_summarize_url(video_url: str) -> str:
@@ -451,7 +716,7 @@ def gemini_summarize_url(video_url: str) -> str:
         "If you cannot access the video, say so explicitly and provide a one-sentence guess based on the title only.\n"
         f"URL: {video_url}"
     )
-    return _gemini_request({"contents": [{"parts": [{"text": prompt}]}]})
+    return _complete(prompt)
 
 
 def gemini_summarize_metadata(meta: dict) -> str:
@@ -463,7 +728,7 @@ def gemini_summarize_metadata(meta: dict) -> str:
         f"Description:\n{meta.get('description','')}\n"
     )
     prompt = "Summarize the following video metadata as best as possible:\n\n" + blob
-    return _gemini_request({"contents": [{"parts": [{"text": prompt[:25000]}]}]})
+    return _complete(prompt[:25000])
 
 
 # -------------------- Document helpers --------------------
@@ -482,14 +747,171 @@ def add_video_section(doc: Document, video_id: str, summary: str, published: Opt
     doc.add_paragraph(summary)
 
 
+def process_one_video(
+    *,
+    vid: str,
+    snippet: dict,
+    doc: Optional[Document],
+    transcripts_only: bool,
+    skip_existing: bool,
+    existing_video_ids: set,
+    show_date: bool,
+    date_format: str,
+    summarize_url_fallback: bool,
+    sleep_s: float,
+    log: logging.Logger,
+    preset_transcript: Optional[str] = None,
+) -> None:
+    """Fetch one transcript, save it, and optionally append a summary to doc."""
+    video_title = snippet.get("title", "")
+    published_at = snippet.get("publishedAt")
+
+    if preset_transcript is None and skip_existing and vid in existing_video_ids:
+        log.info(f"ℹ️  Skipping existing transcript for https://youtu.be/{vid}")
+        time.sleep(sleep_s)
+        return
+
+    published_str = None
+    if show_date:
+        published_str = format_published_date(published_at, date_format)
+
+    if preset_transcript is not None:
+        transcript = preset_transcript
+    else:
+        log.info(f"�� Fetching transcript for https://youtu.be/{vid}")
+        transcript = fetch_transcript_text(vid)
+
+    if not transcript:
+        msg = "No transcript available."
+        if transcripts_only:
+            log.info(f"ℹ️  {msg} for https://youtu.be/{vid}")
+            time.sleep(sleep_s)
+            return
+        summary_done = False
+        if summarize_url_fallback:
+            log.info("No transcript. Trying URL summarization fallback…")
+            url = f"https://youtu.be/{vid}"
+            try:
+                summary = gemini_summarize_url(url)
+                if summary and len(summary.strip()) > 40:
+                    add_video_section(doc, vid, summary, published=published_str)
+                    summary_done = True
+            except Exception as e:
+                msg += f" URL fallback error: {e}"
+
+        if not summary_done:
+            try:
+                meta = {
+                    "title": snippet.get("title", ""),
+                    "description": snippet.get("description", ""),
+                    "publishedAt": snippet.get("publishedAt", ""),
+                    "channelTitle": snippet.get("channelTitle", ""),
+                }
+                summary = gemini_summarize_metadata(meta)
+                add_video_section(doc, vid, summary, published=published_str)
+                summary_done = True
+            except Exception:
+                pass
+
+        if not summary_done:
+            add_video_section(doc, vid, msg, published=published_str)
+        time.sleep(sleep_s)
+        return
+
+    if preset_transcript is None:
+        save_transcript(transcript, vid, video_title, published_at)
+    if transcripts_only:
+        time.sleep(sleep_s)
+        return
+
+    try:
+        log.info("�� Summarizing with Gemini…")
+        summary = gemini_summarize(transcript)
+        log.info("✅ Summary complete.")
+    except Exception as e:
+        log.error(f"❌ Gemini error: {e}")
+        summary = f"Error summarizing: {e}"
+    add_video_section(doc, vid, summary, published=published_str)
+    time.sleep(sleep_s)
+
+
+def _video_kwargs(args, log, doc, existing_video_ids: set) -> dict:
+    return {
+        "doc": doc,
+        "transcripts_only": args.transcripts_only,
+        "skip_existing": args.skip_existing,
+        "existing_video_ids": existing_video_ids,
+        "show_date": args.show_date,
+        "date_format": args.date_format,
+        "summarize_url_fallback": args.summarize_url_fallback,
+        "sleep_s": args.sleep,
+        "log": log,
+    }
+
+
+def run_youtube_video(args, log) -> None:
+    """Transcribe one video. Also write a .docx summary unless transcripts-only is set."""
+    try:
+        video_id = parse_video_id(args.youtube_video)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+    youtube = build_youtube_client()
+    snippet = get_video_snippet(youtube, video_id)
+    title = snippet.get("title") or video_id
+    log.info(f"Video: {title} (https://youtu.be/{video_id})")
+
+    saved = find_saved_transcript(video_id) if args.skip_existing else None
+    preset_transcript = None
+    if saved:
+        if args.transcripts_only:
+            log.info(f"ℹ️  Skipping existing transcript for https://youtu.be/{video_id}")
+            print(f"Transcript already saved: {saved}. Pass --no-skip-existing to fetch again.")
+            return
+        preset_transcript = saved.read_text(encoding="utf-8").strip()
+        if preset_transcript:
+            log.info(f"Using saved transcript: {saved.name}")
+        else:
+            preset_transcript = None
+
+    doc = None
+    if not args.transcripts_only:
+        doc = Document()
+        doc.add_heading(title, level=0)
+
+    process_one_video(
+        vid=video_id,
+        snippet=snippet,
+        preset_transcript=preset_transcript,
+        **_video_kwargs(args, log, doc, set()),
+    )
+
+    if doc is not None:
+        _save_docx(doc, args.out, args.rtl)
+        print(f"Done! File saved as: {args.out}")
+    else:
+        print("Done! Transcript saved in: transcripts/")
+
+
 # -------------------- Main --------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Summarize latest YouTube videos with Gemini and export to DOCX.")
-    parser.add_argument("--channels", type=str, required=True, help="Path to a text file with one YouTube channel URL per line.")
+    parser.add_argument("--mcp", action="store_true",
+                        help="Run as an MCP stdio server instead of the CLI pipeline.")
+    parser.add_argument("--channels", type=str, default=None, help="Path to a text file with one YouTube channel URL per line.")
+    parser.add_argument("--youtube-video", "--youtube_video", dest="youtube_video", type=str, default=None,
+                        help="One YouTube video URL or 11-character id. Saves a transcript and, unless --transcribe_only is set, a summary .docx.")
+    parser.add_argument("--text-files-dir", "--text_files_dir", dest="text_files_dir", type=str, default=None,
+                        help="Folder of .txt files to summarize. Other extensions are ignored. Skips YouTube.")
+    parser.add_argument("--provider", choices=["gemini", "kimi"], default="gemini",
+                        help="Summarization provider. kimi uses MOONSHOT_API_KEY from platform.kimi.ai (default: gemini).")
     parser.add_argument("--out", type=str, default="YouTube_Summaries.docx", help="Output .docx file path.")
-    parser.add_argument("--transcripts-only", action="store_true",
-                        help="Fetch and save transcripts only; skip Gemini summarization and DOCX output.")
+    parser.add_argument("--rtl", action="store_true",
+                        help="Save the .docx with right-to-left layout for Hebrew.")
+    parser.add_argument("--transcripts-only", "--transcribe-only", "--transcribe_only", dest="transcripts_only",
+                        action="store_true",
+                        help="Fetch and save transcripts only; skip summarization and DOCX output.")
     parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True,
                         help="Skip videos that already have transcript files (default: true).")
     parser.add_argument("--per-channel", type=int, default=30, help="How many latest videos to fetch per channel (default 30).")
@@ -509,7 +931,47 @@ def main():
                         help="strftime format for dates when --show-date is used (default: %%Y-%%m-%%d).")
 
     args = parser.parse_args()
-    load_env(require_gemini=not args.transcripts_only)
+    if args.mcp:
+        fetch_transcript_with_ytdlp._cookies_path = args.cookies
+        fetch_transcript_with_ytdlp._cookies_browser = args.cookies_from_browser
+        fetch_transcript_with_ytdlp._cookies_profile = args.cookies_profile
+        fetch_transcript_with_ytdlp._rustypipe_bin = args.rustypipe_bin
+        fetch_transcript_with_ytdlp._po_token = args.po_token
+        fetch_transcript_with_ytdlp._verbose = False
+        from mcp_server import run as run_mcp
+        run_mcp(yt_module=sys.modules[__name__])
+        return
+    sources = [name for name, value in (
+        ("--channels", args.channels),
+        ("--youtube_video", args.youtube_video),
+        ("--text-files-dir", args.text_files_dir),
+    ) if value]
+    if len(sources) > 1:
+        parser.error(f"Use only one of --channels, --youtube_video, or --text-files-dir (got {', '.join(sources)})")
+    if args.text_files_dir and args.transcripts_only:
+        parser.error("--text-files-dir summarizes local files; it cannot be combined with --transcribe_only")
+    if not sources:
+        parser.error("--channels, --youtube_video, or --text-files-dir is required unless --mcp is set")
+
+    if args.text_files_dir:
+        load_env(
+            require_gemini=args.provider == "gemini",
+            require_youtube=False,
+            require_kimi=args.provider == "kimi",
+        )
+        os.environ["SUMMARY_PROVIDER"] = args.provider
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        out_path = args.out
+        if out_path == parser.get_default("out"):
+            out_path = "text_summaries.docx"
+        summarize_text_files(args.text_files_dir, out_path, args.sleep, rtl=args.rtl)
+        return
+
+    load_env(
+        require_gemini=(not args.transcripts_only) and args.provider == "gemini",
+        require_kimi=(not args.transcripts_only) and args.provider == "kimi",
+    )
+    os.environ["SUMMARY_PROVIDER"] = args.provider
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     log = logging.getLogger(__name__)
 
@@ -519,6 +981,10 @@ def main():
     fetch_transcript_with_ytdlp._cookies_profile = args.cookies_profile
     fetch_transcript_with_ytdlp._rustypipe_bin = args.rustypipe_bin
     fetch_transcript_with_ytdlp._po_token = args.po_token
+
+    if args.youtube_video:
+        run_youtube_video(args, log)
+        return
 
     youtube = build_youtube_client()
     doc = None
@@ -548,80 +1014,14 @@ def main():
         existing_video_ids = get_existing_transcript_video_ids() if args.skip_existing else set()
 
         for vid in video_ids:
-            # Always fetch snippet to get title and published date (needed for transcript saving)
-            snippet_for_meta = snippets_by_id.get(vid, {})
-            video_title = snippet_for_meta.get("title", "")
-            published_at = snippet_for_meta.get("publishedAt")
-
-            if args.skip_existing and vid in existing_video_ids:
-                log.info(f"ℹ️  Skipping existing transcript for https://youtu.be/{vid}")
-                time.sleep(args.sleep)
-                continue
-            
-            # Format published date for display if requested
-            published_str = None
-            if args.show_date:
-                published_str = format_published_date(published_at, args.date_format)
-
-            log.info(f"�� Fetching transcript for https://youtu.be/{vid}")
-            transcript = fetch_transcript_text(vid)
-
-            if not transcript:
-                msg = "No transcript available."
-                if args.transcripts_only:
-                    log.info(f"ℹ️  {msg} for https://youtu.be/{vid}")
-                    time.sleep(args.sleep)
-                    continue
-                summary_done = False
-                if args.summarize_url_fallback:
-                    log.info("No transcript. Trying URL summarization fallback…")
-                    url = f"https://youtu.be/{vid}"
-                    try:
-                        summary = gemini_summarize_url(url)
-                        if summary and len(summary.strip()) > 40:
-                            add_video_section(doc, vid, summary, published=published_str)
-                            summary_done = True
-                    except Exception as e:
-                        msg += f" URL fallback error: {e}"
-
-                if not summary_done:
-                    # Metadata fallback: title+description
-                    try:
-                        meta = {
-                            "title": snippet_for_meta.get("title", ""),
-                            "description": snippet_for_meta.get("description", ""),
-                            "publishedAt": snippet_for_meta.get("publishedAt", ""),
-                            "channelTitle": snippet_for_meta.get("channelTitle", ""),
-                        }
-                        summary = gemini_summarize_metadata(meta)
-                        add_video_section(doc, vid, summary, published=published_str)
-                        summary_done = True
-                    except Exception:
-                        pass
-
-                if not summary_done:
-                    add_video_section(doc, vid, msg, published=published_str)
-                time.sleep(args.sleep)
-                continue
-
-            # Save transcript to file
-            save_transcript(transcript, vid, video_title, published_at)
-            if args.transcripts_only:
-                time.sleep(args.sleep)
-                continue
-
-            try:
-                log.info("�� Summarizing with Gemini…")
-                summary = gemini_summarize(transcript)
-                log.info("✅ Summary complete.")
-            except Exception as e:
-                log.error(f"❌ Gemini error: {e}")
-                summary = f"Error summarizing: {e}"
-            add_video_section(doc, vid, summary, published=published_str)
-            time.sleep(args.sleep)
+            process_one_video(
+                vid=vid,
+                snippet=snippets_by_id.get(vid, {}),
+                **_video_kwargs(args, log, doc, existing_video_ids),
+            )
 
     if doc is not None:
-        doc.save(args.out)
+        _save_docx(doc, args.out, args.rtl)
         print(f"✅ Done! File saved as: {args.out}")
     else:
         print("✅ Done! Transcripts saved in: transcripts/")
